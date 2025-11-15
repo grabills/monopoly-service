@@ -89,7 +89,7 @@ const setupDatabase = async () => {
   }
 };
 
-// --- Original Player Endpoints ---
+// --- Original Player Endpoints (modified to use pg.Client) ---
 
 app.get('/', (req, res) => {
   res.send('Hello, CS 262 Monopoly service!');
@@ -120,9 +120,43 @@ app.get('/players/:id', async (req, res) => {
   }
 });
 
+app.post('/players', async (req, res) => {
+  const { email, name } = req.body;
+  try {
+    const result = await db.query(
+      'INSERT INTO Player(email, name) VALUES ($1, $2) RETURNING id',
+      [email, name],
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/players/:id', async (req, res) => {
+  const { id } = req.params;
+  const { email, name } = req.body;
+  try {
+    const result = await db.query(
+      'UPDATE Player SET email = $1, name = $2 WHERE id = $3 RETURNING id',
+      [email, name, id],
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Player not found' });
+    } else {
+      res.json(result.rows[0]);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.delete('/players/:id', async (req, res) => {
   const { id } = req.params;
   try {
+    // ON DELETE CASCADE will handle PlayerGame entries
     const result =
       await db.query('DELETE FROM Player WHERE id = $1 RETURNING *', [id]);
     if (result.rows.length === 0) {
