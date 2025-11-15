@@ -1,221 +1,210 @@
-/**
- * This module implements a REST-inspired web service for the Monopoly DB hosted
- * on PostgreSQL for Azure. Notes:
- *
- * - Currently, this service supports the Player table only.
- *
- * - This service is written in TypeScript and uses Node type-stripping, which
- * is experimental, but simple (see: https://nodejs.org/en/learn/typescript/run-natively).
- * To do a static type check, run the following:
- *      npm run type-check
- *
- * - The service assumes that the database connection strings and the server
- * mode are set in environment variables (e.g., using a git-ignored `.env.sh` file).
- * See the DB_* variables used by pgPromise.
- *
- * - To execute locally, run the following:
- *      source .env
- *      npm start
- *
- * - To guard against SQL injection attacks, this code uses pgPromise's built-in
- * variable escaping. This prevents a client from issuing this SQL-injection URL:
- *     `https://cs262.azurewebsites.net/players/1;DELETE FROM Player`
- * which would delete records in the PlayerGame and then the Player tables.
- * In particular, we don't use JS template strings because this doesn't filter
- * client-supplied values properly. We didn't do this, but we would also want to
- * create and connect to a new PostgreSQL account with limited privileges for the
- * application, rather than using the administrator account, which can get DB
- * meta-information from the system tables.
- *
- * - The endpoints call `next(err)` to handle errors without crashing the service.
- * This initiates the default error handling middleware, which logs full error
- * details to the server-side console and returns uninformative HTTP 500
- * responses to clients. This makes the service a bit more secure (because it
- * doesn't reveal database details to clients), but also makes it more difficult
- * for API users (because they don't get useful error messages).
- *
- * @author: kvlinden
- * @date: Summer, 2020
- * @date: Fall, 2025 (updated to JS->TS, Node version, master->main repo, added SQL injection examples)
- */
-
 import express from 'express';
-import pgPromise from 'pg-promise';
+import { Client } from 'pg';
+import cors from 'cors';
+import 'dotenv/config';
 
-// Import types for compile-time checking.
-import type { Request, Response, NextFunction } from 'express';
-import type { Player, PlayerInput } from './player.js';
-
-// Set up the database
-const db = pgPromise()({
-    host: process.env.DB_SERVER,
-    port: parseInt(process.env.DB_PORT as string) || 5432,
-    database: process.env.DB_DATABASE,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-});
-
-// Configure the server and its routes
+// Initialize Express app
 const app = express();
-const port: number = parseInt(process.env.PORT as string) || 3000;
-const router = express.Router();
+const port = process.env.PORT || 3000;
 
-router.use(express.json());
-router.get('/', readHello);
-router.get('/players', readPlayers);
-router.get('/players/:id', readPlayer);
-router.put('/players/:id', updatePlayer);
-router.post('/players', createPlayer);
-router.delete('/players/:id', deletePlayer);
-
-// For testing only; vulnerable to SQL injection!
-// router.get('/bad/players/:id', readPlayerBad);
-
-app.use(router);
-
-// Custom error handler - must be defined AFTER all routes
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction): void => {
-    // Log the full error server-side for debugging
-    console.error('Error:', err.message);
-    console.error('Stack:', err.stack);
-
-    // Send generic error to client (never expose internal details)
-    res.status(500).json({
-        error: 'An internal server error occurred'
-    });
+// Set up PostgreSQL client
+const db = new Client({
+  // Use DATABASE_URL from Azure environment variables
+  // It should have been set by Azure, but if not,
+  // we'll try to build it from the other DB_ variables.
+  connectionString:
+    process.env.DATABASE_URL ||
+    `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_SERVER}:${process.env.DB_PORT}/${process.env.DB_DATABASE}`,
+  ssl: { rejectUnauthorized: false }, // Required for Azure connections
 });
 
-app.listen(port, (): void => {
-    console.log(`Listening on port ${port}`);
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// --- DATABASE SETUP SCRIPT ---
+// This function runs once on server startup to create/reset the tables
+const setupDatabase = async () => {
+  const sqlScript = `
+    -- Drop tables in reverse order of dependency
+    DROP TABLE IF EXISTS PlayerGame;
+    DROP TABLE IF EXISTS Game;
+    DROP TABLE IF EXISTS Player;
+
+    -- Player table
+    CREATE TABLE Player (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE
+    );
+
+    -- Game table
+    CREATE TABLE Game (
+        id SERIAL PRIMARY KEY,
+        time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- PlayerGame join table
+    CREATE TABLE PlayerGame (
+        gameID INTEGER REFERENCES Game(id) ON DELETE CASCADE,
+        playerID INTEGER REFERENCES Player(id) ON DELETE CASCADE,
+        score INTEGER,
+        PRIMARY KEY (gameID, playerID)
+    );
+
+    -- --- SAMPLE DATA ---
+
+    -- Insert sample players
+    INSERT INTO Player (name, email) VALUES
+    ('Sebastian', 'seb@example.com'),
+    ('Mr. Monopoly', 'moneybags@example.com'),
+    ('Thimble', 'thimble@example.com');
+
+    -- Insert sample game 1
+    INSERT INTO Game (time) VALUES (NOW() - INTERVAL '2 days');
+    INSERT INTO PlayerGame (gameID, playerID, score) VALUES
+    (1, 1, 1500),
+    (1, 2, 2500);
+
+    -- Insert sample game 2
+    INSERT INTO Game (time) VALUES (NOW() - INTERVAL '1 day');
+    INSERT INTO PlayerGame (gameID, playerID, score) VALUES
+    (2, 1, 3200),
+    (2, 2, 1800),
+    (2, 3, 500);
+
+    -- Insert sample game 3
+    INSERT INTO Game (time) VALUES (NOW());
+    INSERT INTO PlayerGame (gameID, playerID, score) VALUES
+    (3, 2, 5000),
+    (3, 3, 4500);
+  `;
+
+  try {
+    await db.query(sqlScript);
+    console.log('Database schema and sample data initialized successfully.');
+  } catch (err) {
+    console.error('Error initializing database:', err);
+    throw err; // Stop the server from starting if this fails
+  }
+};
+
+// --- Original Player Endpoints ---
+
+app.get('/', (req, res) => {
+  res.send('Hello, CS 262 Monopoly service!');
 });
 
-/**
- * This utility function standardizes the response pattern for database queries,
- * returning the data using the given response, or a 404 status for null data
- * (e.g., when a record is not found).
- */
-function returnDataOr404(response: Response, data: unknown): void {
-    if (data == null) {
-        response.sendStatus(404);
+app.get('/players', async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM Player ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/players/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await db.query('SELECT * FROM Player WHERE id = $1', [id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Player not found' });
     } else {
-        response.send(data);
+      res.json(result.rows[0]);
     }
-}
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-/**
- * This endpoint returns a simple hello-world message, serving as a basic
- * health check and welcome message for the API.
- */
-function readHello(_request: Request, response: Response): void {
-    response.send('Hello, CS 262 Monopoly service!');
-}
+app.delete('/players/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result =
+      await db.query('DELETE FROM Player WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Player not found' });
+    } else {
+      res.json({ message: 'Player deleted successfully', player: result.rows[0] });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-// CRUD functions
+// --- NEW HOMEWORK 3 GAME ENDPOINTS ---
 
-/**
- * Retrieves all players from the database.
- */
-function readPlayers(_request: Request, response: Response, next: NextFunction): void {
-    db.manyOrNone('SELECT * FROM Player')
-        .then((data: Player[]): void => {
-            // data is a list, never null, so returnDataOr404 isn't needed.
-            response.send(data);
-        })
-        .catch((error: Error): void => {
-            next(error);
-        });
-}
+app.get('/games', async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM Game ORDER BY time DESC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-/**
- * Retrieves a specific player by ID.
- */
-function readPlayer(request: Request, response: Response, next: NextFunction): void {
-    db.oneOrNone('SELECT * FROM Player WHERE id=${id}', request.params)
-        .then((data: Player | null): void => {
-            returnDataOr404(response, data);
-        })
-        .catch((error: Error): void => {
-            next(error);
-        });
-}
+app.get('/games/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const query = `
+      SELECT P.name, PG.score
+      FROM Player P
+      JOIN PlayerGame PG ON P.id = PG.playerID
+      WHERE PG.gameID = $1
+      ORDER BY PG.score DESC
+    `;
+    const result = await db.query(query, [id]);
 
-/**
- * This function is intentionally vulnerable to SQL injection attacks because it:
- * - Directly concatenates user input into the SQL query string rather than using parameterized queries.
- * - Allows manyOrNone results, rather than the zero-or-one it should expect.
- * - Uses a PSQL administrator account, which has more privileges than it needs.
- * See `sql/test-sqlInjection.http` for example attack URLs and CURL commands.
- */
-// function readPlayerBad(request: Request, response: Response, next: NextFunction): void {
-//     db.manyOrNone('SELECT * FROM Player WHERE id=' + request.params.id)
-//         .then((data: Player[] | null): void => {
-//             returnDataOr404(response, data);
-//         })
-//         .catch((error: Error): void => {
-//             next(error);
-//         });
-// }
+    if (result.rows.length === 0) {
+      const gameExists = await db.query('SELECT * FROM Game WHERE id = $1', [id]);
+      if (gameExists.rows.length === 0) {
+        res.status(404).json({ error: 'Game not found' });
+      } else {
+        res.json([]); // Return empty list if game exists but has no players
+      }
+    } else {
+      res.json(result.rows);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-/**
- * This function updates an existing player's information, returning the
- * updated player's ID if successful, or a 404 status if the player doesn't
- * exist.
- */
-function updatePlayer(request: Request, response: Response, next: NextFunction): void {
-    db.oneOrNone('UPDATE Player SET email=${body.email}, name=${body.name} WHERE id=${params.id} RETURNING id', {
-        params: request.params,
-        body: request.body as PlayerInput
-    })
-        .then((data: { id: number } | null): void => {
-            returnDataOr404(response, data);
-        })
-        .catch((error: Error): void => {
-            next(error);
-        });
-}
+app.delete('/games/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    // The ON DELETE CASCADE in the schema will handle deleting from PlayerGame
+    const result =
+      await db.query('DELETE FROM Game WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Game not found' });
+    } else {
+      res.json({ message: 'Game deleted successfully', game: result.rows[0] });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-/**
- * This function creates a new player in the database based on the provided
- * email and name, returning the newly created player's ID. The database is
- * assumed to automatically assign a unique ID using auto-increment.
- */
-function createPlayer(request: Request, response: Response, next: NextFunction): void {
-    db.one('INSERT INTO Player(email, name) VALUES (${email}, ${name}) RETURNING id',
-        request.body as PlayerInput
-    )
-        .then((data: { id: number }): void => {
-            // New players are always created, so returnDataOr404 isn't needed.
-            response.send(data);
-        })
-        .catch((error: Error): void => {
-            next(error);
-        });
-}
-
-/**
- * This function deletes an existing player based on ID.
- *
- * Deleting a player requires cascading deletion of PlayerGame records first to
- * maintain referential integrity. This function uses a transaction (`tx()`) to
- * ensure that both the PlayerGame records and the Player record are deleted
- * atomically (i.e., either both operations succeed or both fail together).
- *
- * This function performs a "hard" delete that actually removes records from the
- * database. Production systems generally to use "soft" deletes in which records
- * are marked as archived/deleted rather than actually deleting them. This helps
- * support data recovery and audit trails.
- */
-function deletePlayer(request: Request, response: Response, next: NextFunction): void {
-    db.tx((t) => {
-        return t.none('DELETE FROM PlayerGame WHERE playerID=${id}', request.params)
-            .then(() => {
-                return t.oneOrNone('DELETE FROM Player WHERE id=${id} RETURNING id', request.params);
-            });
-    })
-        .then((data: { id: number } | null): void => {
-            returnDataOr404(response, data);
-        })
-        .catch((error: Error): void => {
-            next(error);
-        });
-}
+// --- START THE SERVER ---
+// We connect to the DB, then set up the schema, THEN start the app
+db.connect()
+  .then(async () => {
+    console.log('Database connected');
+    await setupDatabase(); // Run our new database setup function
+    app.listen(port, () => {
+      // Start the app *after* the DB is ready
+      console.log(`Monopoly service listening at http://localhost:${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Database connection error:', err);
+    process.exit(1); // Exit if DB connection fails
+  });
